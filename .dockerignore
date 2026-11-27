@@ -1,0 +1,7 @@
+target/
+**/target/
+.idea/
+.git/
+*.jar
+.env
+.env.*

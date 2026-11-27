@@ -5,10 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
+import school.sptech.dto.AlertaGoldDto;
 import software.amazon.awssdk.core.sync.ResponseTransformer;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import school.sptech.dto.AlertaDto;
 
 public class GoldReader {
 
@@ -19,14 +19,15 @@ public class GoldReader {
         this.s3Client = s3Client;
     }
 
-    public List<AlertaDto> ler(String bucket, String chave) throws IOException {
+    public List<AlertaGoldDto> ler(String bucket, String chave) throws IOException {
         GetObjectRequest request = GetObjectRequest.builder()
                 .bucket(bucket)
                 .key(chave)
                 .build();
 
         try (InputStream conteudo = s3Client.getObject(request, ResponseTransformer.toInputStream())) {
-            return objectMapper.readValue(conteudo, new TypeReference<List<AlertaDto>>() {});
+            List<AlertaGoldDto> eventos = objectMapper.readValue(conteudo, new TypeReference<List<AlertaGoldDto>>() {});
+            return eventos == null ? List.of() : eventos;
         }
     }
 }
