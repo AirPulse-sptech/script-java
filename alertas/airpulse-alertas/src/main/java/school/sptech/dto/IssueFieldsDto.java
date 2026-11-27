@@ -1,10 +1,13 @@
 package school.sptech.dto;
 
+import java.util.List;
+
 public class IssueFieldsDto {
 
     private ProjectDto project;
     private String summary;
     private IssueTypeDto issuetype;
+    private List<String> labels;
 
     public IssueFieldsDto() {
     }
@@ -13,6 +16,13 @@ public class IssueFieldsDto {
         this.project = project;
         this.summary = summary;
         this.issuetype = issuetype;
+    }
+
+    public IssueFieldsDto(ProjectDto project, String summary, IssueTypeDto issuetype, List<String> labels) {
+        this.project = project;
+        this.summary = summary;
+        this.issuetype = issuetype;
+        this.labels = labels;
     }
 
     public ProjectDto getProject() {
@@ -37,5 +47,13 @@ public class IssueFieldsDto {
 
     public void setIssuetype(IssueTypeDto issuetype) {
         this.issuetype = issuetype;
+    }
+
+    public List<String> getLabels() {
+        return labels;
+    }
+
+    public void setLabels(List<String> labels) {
+        this.labels = labels;
     }
 }

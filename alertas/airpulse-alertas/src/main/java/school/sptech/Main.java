@@ -1,83 +1,142 @@
 package school.sptech;
 
+import java.net.http.HttpTimeoutException;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import school.sptech.config.Jira;
 import school.sptech.config.S3Provider;
-import school.sptech.dto.AlertaDto;
-import school.sptech.model.Componente;
-import school.sptech.model.Nivel;
-import school.sptech.repository.ComponenteRepository;
+import school.sptech.dto.AlertaGoldDto;
+import school.sptech.service.AlertaConsolidator;
 import school.sptech.service.GoldReader;
-import school.sptech.service.VerificadorLimites;
+import school.sptech.service.S3AlertLister;
+import school.sptech.util.AlertUtils;
+import school.sptech.util.LogUtils;
+import software.amazon.awssdk.services.s3.S3Client;
 
 public class Main {
 
-    public static void main(String[] args) throws Exception {
-        // para mudar as váriaveis de ambiente, clique no triângulo verde a esquerda de public static void main
-        // "modify run configuration" e em enviroment variables clique no simbolo de página
-        String bucket = obrigatoria("BUCKET_GOLD");
-        String chave = System.getenv().getOrDefault("GOLD_KEY", "leituras_componentes.json");
-        String projetoJira = obrigatoria("JIRA_PROJECT_KEY");
-        String tipoIssue = System.getenv().getOrDefault("JIRA_ISSUE_TYPE", "Task");
+    public static void main(String[] args) {
+        String rawBucket = AlertUtils.requiredEnv("aws_s3_bucket");
+        final String bucket = rawBucket.startsWith("s3://") ? rawBucket.substring(5) : rawBucket;
+        String prefix = AlertUtils.envOrDefault("aws_s3_alertas_prefix", "03-gold/");
+        String jiraBaseUrl = AlertUtils.requiredEnv("JIRA_BASE_URL");
+        String jiraEmail = AlertUtils.requiredEnv("JIRA_EMAIL");
+        String jiraToken = AlertUtils.requiredEnv("JIRA_API_TOKEN");
+        String jiraProjectKey = AlertUtils.requiredEnv("JIRA_ALERT_PROJECT_KEY");
+        String jiraIssueType = AlertUtils.envOrDefault("JIRA_ALERT_ISSUE_TYPE", "Task");
 
-        Jira jira = new Jira(obrigatoria("JIRA_BASE_URL"), obrigatoria("JIRA_EMAIL"), obrigatoria("JIRA_API_TOKEN"));
+        S3Client s3Client = new S3Provider().getS3Client();
+        S3AlertLister lister = new S3AlertLister(s3Client);
+        GoldReader goldReader = new GoldReader(s3Client);
+        Jira jira = new Jira(jiraBaseUrl, jiraEmail, jiraToken, jiraProjectKey);
 
-        System.out.println("Lendo s3://" + bucket + "/" + chave);
-        List<AlertaDto> eventos = new GoldReader(new S3Provider().getS3Client()).ler(bucket, chave);
-        System.out.println("Eventos recebidos: " + eventos.size());
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                verificarEcriarAlertas(lister, goldReader, jira, bucket, prefix, jiraProjectKey, jiraIssueType);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                scheduler.shutdown();
+            } catch (Exception e) {
+                LogUtils.error("Erro no ciclo de sincronização Jira: " + e.getMessage());
+            }
+        }, 0, 1, TimeUnit.MINUTES);
 
-        int alertas = 0;
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            scheduler.shutdown();
+            try {
+                scheduler.awaitTermination(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            s3Client.close();
+        }));
+    }
 
-        try (ComponenteRepository repository = new ComponenteRepository(
-                obrigatoria("DB_URL"), obrigatoria("DB_USER"), obrigatoria("DB_PASSWORD"))) {
+    static void verificarEcriarAlertas(
+            S3AlertLister lister,
+            GoldReader goldReader,
+            Jira jira,
+            String bucket,
+            String prefix,
+            String jiraProjectKey,
+            String jiraIssueType) throws InterruptedException {
+        List<String> keys = lister.listar(bucket, prefix);
+        LogUtils.info("Arquivos Gold encontrados: " + keys.size());
 
-            for (AlertaDto evento : eventos) {
-                if (evento.componenteId() == null || evento.valor() == null) {
-                    System.out.println("[AVISO] Evento sem componente_id ou valor. Ignorado.");
-                    continue;
-                }
-
-                Optional<Componente> encontrado = repository.buscarPorId(evento.componenteId());
-
-                if (encontrado.isEmpty()) {
-                    System.out.println("[AVISO] Componente " + evento.componenteId() + " não existe no banco. Ignorado.");
-                    continue;
-                }
-
-                Componente componente = encontrado.get();
-                Nivel nivel = VerificadorLimites.classificar(evento.valor(), componente);
-
-                System.out.printf("%-8s %s | %s | valor %.1f | atenção %.1f | crítico %.1f%n",
-                        nivel, componente.aeronave(), componente.tipo(), evento.valor(),
-                        componente.limiteAtencao(), componente.limiteCritico());
-
-                if (nivel != Nivel.NORMAL) {
-                    String resumo = montarResumo(nivel, componente, evento.valor(), evento.fase());
-                    String resposta = jira.createIssue(projetoJira, resumo, tipoIssue);
-                    System.out.println("   -> issue criada no Jira: " + resposta);
-                    alertas++;
-                }
+        List<AlertaGoldDto> todosEventos = new ArrayList<>();
+        for (String key : keys) {
+            try {
+                todosEventos.addAll(goldReader.ler(bucket, key));
+            } catch (Exception e) {
+                LogUtils.error("Erro ao ler " + key + ": " + e.getMessage());
             }
         }
+        LogUtils.info("Total de eventos lidos: " + todosEventos.size());
 
-        System.out.println("Concluído. Alertas enviados ao Jira: " + alertas);
-    }
-
-    private static String montarResumo(Nivel nivel, Componente c, double valor, String fase) {
-        String rotulo = nivel == Nivel.CRITICO ? "CRÍTICO" : "ATENÇÃO";
-        double limite = nivel == Nivel.CRITICO ? c.limiteCritico() : c.limiteAtencao();
-        String unidade = c.unidade() == null ? "" : " " + c.unidade();
-        String faseTxt = fase == null ? "" : " | fase " + fase;
-        return String.format("[%s] %s - %s (%s): %.1f%s, limite %.1f%s%s",
-                rotulo, c.aeronave(), c.tipo(), c.modelo(), valor, unidade, limite, unidade, faseTxt);
-    }
-
-    private static String obrigatoria(String nome) {
-        String valor = System.getenv(nome);
-        if (valor == null || valor.isBlank()) {
-            throw new IllegalStateException("Variável de ambiente não definida: " + nome);
+        AlertaConsolidator.ConsolidationResult consolidacao =
+                AlertaConsolidator.consolidarComResumo(todosEventos);
+        List<AlertaGoldDto> consolidados = consolidacao.consolidados();
+        LogUtils.info("Alertas consolidados: " + consolidados.size());
+        if (consolidacao.gruposInconsistentes() > 0 || consolidacao.timestampsInvalidos() > 0) {
+            LogUtils.warn(String.format(
+                    "Consolidação com descartes: grupos_inconsistentes=%d, ts_invalidos=%d",
+                    consolidacao.gruposInconsistentes(), consolidacao.timestampsInvalidos()));
         }
-        return valor;
+
+        List<AlertaGoldDto> abertos = consolidados.stream()
+                .filter(a -> Boolean.TRUE.equals(a.emAbertoAposEvento()))
+                .toList();
+        LogUtils.info("Alertas abertos: " + abertos.size());
+
+        int criadas = 0;
+        for (AlertaGoldDto alerta : abertos) {
+            String label = sanitizarLabelAlerta(alerta.alertaId());
+            try {
+                if (jira.issueExistePorLabel(label)) {
+                    LogUtils.info(String.format("[EXISTE] %s | %s | %s | maior_nivel=%s | label=%s",
+                            alerta.hostname(), alerta.placaSerie(), alerta.metrica(), alerta.maiorNivel(), label));
+                    continue;
+                }
+
+                String summary = AlertUtils.montarResumo(alerta, false);
+                String resposta = jira.createIssue(jiraProjectKey, summary, jiraIssueType, List.of(label));
+                String issueKey = jira.extrairIssueKey(resposta);
+                LogUtils.info(String.format("[CRIADA] %s | %s | %s | maior_nivel=%s | label=%s | issue=%s",
+                        alerta.hostname(), alerta.placaSerie(), alerta.metrica(), alerta.maiorNivel(), label, issueKey));
+                criadas++;
+            } catch (InterruptedException e) {
+                throw e;
+            } catch (Jira.JiraRateLimitException e) {
+                LogUtils.error("[RATE_LIMIT] " + e.getMessage() + ". Aguardando próximo ciclo.");
+                break;
+            } catch (HttpTimeoutException e) {
+                LogUtils.error(String.format("[TIMEOUT] label=%s (%s). Consultando label antes de prosseguir.",
+                        label, e.getMessage()));
+                try {
+                    if (jira.issueExistePorLabel(label)) {
+                        LogUtils.info(String.format("[EXISTE_APOS_TIMEOUT] label=%s já foi criada.", label));
+                    }
+                } catch (InterruptedException ie) {
+                    throw ie;
+                } catch (Exception ignored) {
+                    // Próximo ciclo reavaliará
+                }
+            } catch (Exception e) {
+                LogUtils.error(String.format("[ERRO] label=%s: %s", label, e.getMessage()));
+            }
+        }
+        LogUtils.info("Issues criadas neste ciclo: " + criadas);
+    }
+
+    /**
+     * Regra canônica compartilhada com o backend Node.
+     * Delega para {@link AlertUtils#sanitizarLabelAlerta(String)}.
+     */
+    public static String sanitizarLabelAlerta(String alertaId) {
+        return AlertUtils.sanitizarLabelAlerta(alertaId);
     }
 }

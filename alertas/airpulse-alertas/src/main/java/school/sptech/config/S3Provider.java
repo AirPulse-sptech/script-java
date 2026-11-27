@@ -15,9 +15,17 @@ public class S3Provider {
     }
 
     public S3Client getS3Client() {
+        Region region = resolveRegion(System.getenv("aws_region"));
+
         return S3Client.builder()
-              .region(Region.US_EAST_1)
-              .credentialsProvider(credentials)
-              .build();
+                .region(region)
+                .credentialsProvider(credentials)
+                .build();
+    }
+
+    public static Region resolveRegion(String regionEnv) {
+        return (regionEnv != null && !regionEnv.isBlank())
+                ? Region.of(regionEnv.trim())
+                : Region.US_EAST_1;
     }
 }
